@@ -39,6 +39,11 @@ function keepAlive() {
   setInterval(() => {}, 1 << 30);
 }
 
+const T0 = Date.now();
+function mark(label) {
+  if (process.env.VPS_TIMING) process.stderr.write(`  ${Date.now() - T0}ms  ${label}\n`);
+}
+
 function writeLine(s = '') {
   process.stdout.write(s + '\n');
 }
@@ -62,35 +67,47 @@ function saveConfig(c) {
 
 // ---------- ssh ----------
 
+// one connection reused across calls; a route needs a dozen round trips
+function sshArgs(host, remoteCommand = 'bash -s') {
+  return [
+    '-o', 'BatchMode=yes',
+    '-o', 'ConnectTimeout=10',
+    '-o', 'ControlMaster=auto',
+    '-o', 'ControlPath=/tmp/vps-%C',
+    '-o', 'ControlPersist=120',
+    host,
+    remoteCommand,
+  ];
+}
+
 function sshRun(script, input) {
   config();
-  const r = spawnSync(
-    'ssh',
-    ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', cfg.host, 'bash -s'],
-    { input: input === undefined ? script : input, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }
-  );
+  const r = spawnSync('ssh', sshArgs(cfg.host), {
+    input: input === undefined ? script : input,
+    encoding: 'utf8',
+    maxBuffer: 32 * 1024 * 1024,
+  });
   if (r.error) die('ssh: ' + r.error.message);
   if (r.status !== 0) die('remote command failed:\n' + (r.stderr || '').trim());
   return r.stdout;
 }
 
 function sshTry(script, host) {
-  const r = spawnSync(
-    'ssh',
-    ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host || cfg.host, 'bash -s'],
-    { input: script, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }
-  );
+  const r = spawnSync('ssh', sshArgs(host || cfg.host), {
+    input: script,
+    encoding: 'utf8',
+    maxBuffer: 32 * 1024 * 1024,
+  });
   return { ok: r.status === 0, out: r.stdout || '', err: r.stderr || '' };
 }
 
-function sshWrite(remotePath, content) {
+function sshWrite(remotePath, content, alsoDirs = []) {
   config();
-  const dir = remotePath.replace(/\/[^/]+$/, '');
-  const r = spawnSync(
-    'ssh',
-    ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', cfg.host, `bash -c 'mkdir -p ${dir} && cat > ${remotePath}'`],
-    { input: content, encoding: 'utf8' }
-  );
+  const dirs = [remotePath.replace(/\/[^/]+$/, ''), ...alsoDirs].join(' ');
+  const r = spawnSync('ssh', sshArgs(cfg.host, `bash -c 'mkdir -p ${dirs} && cat > ${remotePath}'`), {
+    input: content,
+    encoding: 'utf8',
+  });
   if (r.status !== 0) die(`could not write ${remotePath}: ${(r.stderr || '').trim()}`);
 }
 
@@ -157,21 +174,17 @@ function caddyText(state) {
 }
 
 function uploadCaddy(state) {
-  sshRun(`mkdir -p ${cfg.proxy.sitesDir} ${cfg.proxy.logDir}`);
-  sshWrite(siteFile(), caddyText(state));
+  sshWrite(siteFile(), caddyText(state), [cfg.proxy.logDir]);
 }
 
 function caddyValidateAndReload() {
   config();
   const c = cfg.proxy.container;
-  const check = sshTry(
-    `docker exec ${c} caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1`
-  );
-  if (!check.ok) return { ok: false, out: check.out + check.err };
-  const rel = sshTry(
+  // `caddy reload` validates the new config before swapping, so one call is enough
+  const r = sshTry(
     `docker exec ${c} caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1`
   );
-  return { ok: rel.ok, out: rel.out + rel.err };
+  return { ok: r.ok, out: r.out + r.err };
 }
 
 function ensureCaddyImport() {
@@ -571,6 +584,7 @@ manual dns means you add the records yourself, so any dns host works.
 
   const host = flags.host || rest[0];
   if (!sshCheck(host)) die(`cannot ssh to "${host}". check your ~/.ssh/config`);
+  cfg = { host, proxy: {} }; // enough for sshRun while setup is still running
 
   writeLine(`connected to ${host}`);
   const publicIp = flags.ip || detectIp(host);
@@ -660,7 +674,11 @@ async function addHttp(port, flags) {
   config();
   if (!cfg.domain) die('no domain configured. run: vps setup --domain example.com');
 
+  // start the dns lookup now, it overlaps the ssh round trips below
+  const dnsPending = dnsIsManual() ? Promise.resolve([]) : dnsList();
+
   const state = getState();
+  mark('getState');
   const name = (flags.as || `p${port}`).toLowerCase();
   if (!validLabel(name)) die(`"${name}" is not a valid dns label`);
 
@@ -668,12 +686,14 @@ async function addHttp(port, flags) {
   if (clash) die(`${clash.name} already maps port ${clash.port}. close it first: vps rm ${clash.name}`);
 
   if (!dnsIsManual()) {
-    const existing = await dnsList();
+    const existing = await dnsPending;
     const taken = existing.find((r) => r.name === name && r.type !== 'TXT');
     if (taken) die(`${name}.${cfg.domain} already exists in DNS (${taken.type} ${taken.value})`);
+    mark('dnsList');
   }
 
   const addrs = listenAddrs(port);
+  mark('listenAddrs');
   const loopbackOnly = addrs.length > 0 && addrs.every((a) => a.startsWith('127.') || a === '::1');
   const notListening = addrs.length === 0;
 
@@ -705,15 +725,20 @@ async function addHttp(port, flags) {
     if (!subnet) die(`could not read the subnet of docker network ${cfg.proxy.bridge}`);
     ufwRule = `from ${subnet} to any port ${upstreamPort} proto tcp`;
     sshRun(`ufw allow ${ufwRule} comment 'vps-cli' >/dev/null`);
+    mark('ufw');
   }
 
   const route = { name, port, upstreamPort, relay, ufwRule, created: new Date().toISOString() };
   state.http.push(route);
   putState(state);
+  mark('putState');
   uploadCaddy(state);
+  mark('uploadCaddy');
 
   const imported = ensureCaddyImport();
+  mark('ensureImport');
   const reload = caddyValidateAndReload();
+  mark('caddyReload');
   if (!reload.ok) {
     state.http = state.http.filter((r) => r.name !== name);
     putState(state);
@@ -728,6 +753,7 @@ async function addHttp(port, flags) {
 
   try {
     await dnsAdd(name);
+    mark('dnsAdd');
   } catch (e) {
     await removeHttp(route, { announce: false });
     active.pop();
@@ -810,8 +836,7 @@ function tailRequests(name) {
   config();
   const child = spawn(
     'ssh',
-    ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', cfg.host,
-      `tail -n 0 -F ${cfg.proxy.logDir}/${name}.log 2>/dev/null`],
+    sshArgs(cfg.host, `tail -n 0 -F ${cfg.proxy.logDir}/${name}.log 2>/dev/null`),
     { stdio: ['ignore', 'pipe', 'ignore'] }
   );
   const rl = readline.createInterface({ input: child.stdout });

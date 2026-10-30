@@ -145,6 +145,7 @@ The proxy itself costs under a millisecond. What is left is the round trip from 
 - One server means one location. A viewer on another continent pays the full distance, where a commercial edge network would meet them closer.
 - Names live in public certificate logs forever, even after you close the route.
 - After `vps rm`, resolvers may keep the old address for up to the record TTL, usually 60 seconds.
+- The first https request after a new route can fail for a few seconds while the certificate is issued. `vps http` waits for it unless you pass `--no-wait`.
 
 ## Non-goals
 
