@@ -9,7 +9,7 @@ install -m 0755 "$src" "$dest/vps"
 printf 'installed %s\n' "$dest/vps"
 
 case ":$PATH:" in
-  *":$dest:"*) ;;
+  *":$dest:"*|*":$dest/:"*) ;;
   *)
     printf '\nadd this to your shell profile:\n  export PATH="%s:$PATH"\n' "$dest"
     ;;
